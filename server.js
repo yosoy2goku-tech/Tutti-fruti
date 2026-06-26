@@ -9,22 +9,72 @@ const wss = new WebSocketServer({ server });
 
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Store rooms in memory
 const rooms = {};
 
-function broadcast(roomCode, data, excludeId = null) {
+const CATEGORIES = ['nombre','apellido','animal','fruta','pais','ciudad','color','comida','objeto','profesion'];
+const CATEGORY_NAMES = {
+  nombre:'Nombre de persona', apellido:'Apellido', animal:'Animal',
+  fruta:'Fruta o verdura', pais:'País', ciudad:'Ciudad', color:'Color',
+  comida:'Comida o plato', objeto:'Objeto', profesion:'Profesión u oficio',
+};
+
+// ─── GROQ ────────────────────────────────────────
+async function validateWithGroq(answers, letter) {
+  const GROQ_API_KEY = process.env.GROQ_API_KEY;
+  if (!GROQ_API_KEY) {
+    const result = {};
+    CATEGORIES.forEach(cat => {
+      const val = answers[cat]?.trim() || '';
+      result[cat] = val !== '' && val[0]?.toUpperCase() === letter;
+    });
+    return result;
+  }
+
+  const lines = CATEGORIES
+    .filter(cat => answers[cat]?.trim())
+    .map(cat => `- ${CATEGORY_NAMES[cat]}: "${answers[cat].trim()}"`)
+    .join('\n');
+
+  if (!lines) {
+    const result = {};
+    CATEGORIES.forEach(cat => { result[cat] = false; });
+    return result;
+  }
+
+  const prompt = `Eres árbitro del juego Tutti Frutti en español. Letra de la ronda: "${letter}"
+Respuestas del jugador:
+${lines}
+
+Una respuesta es VÁLIDA si: empieza con "${letter}" (tildes no importan, ej A acepta Ángel), pertenece a la categoría y es palabra real en español.
+Responde SOLO JSON sin explicación: {"nombre":true,"apellido":false,...}
+Incluye todas estas claves: ${CATEGORIES.join(',')}`;
+
+  try {
+    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'llama3-8b-8192', messages: [{ role: 'user', content: prompt }], temperature: 0, max_tokens: 200 }),
+    });
+    const data = await res.json();
+    const text = data.choices?.[0]?.message?.content || '{}';
+    return JSON.parse(text.replace(/```json|```/g, '').trim());
+  } catch (e) {
+    console.error('Groq error:', e.message);
+    const result = {};
+    CATEGORIES.forEach(cat => {
+      const val = answers[cat]?.trim() || '';
+      result[cat] = val !== '' && val[0]?.toUpperCase() === letter;
+    });
+    return result;
+  }
+}
+
+// ─── HELPERS ─────────────────────────────────────
+function broadcastAll(roomCode, data) {
   const room = rooms[roomCode];
   if (!room) return;
   const msg = JSON.stringify(data);
-  room.clients.forEach((client, id) => {
-    if (id !== excludeId && client.ws.readyState === 1) {
-      client.ws.send(msg);
-    }
-  });
-}
-
-function broadcastAll(roomCode, data) {
-  broadcast(roomCode, data, null);
+  room.clients.forEach(client => { if (client.ws.readyState === 1) client.ws.send(msg); });
 }
 
 function sendTo(ws, data) {
@@ -35,27 +85,57 @@ function getRoomState(roomCode) {
   const room = rooms[roomCode];
   if (!room) return null;
   return {
-    players: Object.fromEntries(
-      [...room.clients.entries()].map(([id, c]) => [id, { name: c.name, score: c.score }])
-    ),
+    players: Object.fromEntries([...room.clients.entries()].map(([id, c]) => [id, { name: c.name, score: c.score }])),
     phase: room.phase,
     currentRound: room.currentRound,
     totalRounds: room.totalRounds,
     timeLimit: room.timeLimit,
     currentLetter: room.currentLetter,
     hostId: room.hostId,
+    isPublic: room.isPublic,
+    roomName: room.roomName,
   };
 }
 
+function getPublicRooms() {
+  return Object.entries(rooms)
+    .filter(([, r]) => r.isPublic && r.phase === 'lobby')
+    .map(([code, r]) => ({
+      code,
+      roomName: r.roomName,
+      playerCount: r.clients.size,
+      totalRounds: r.totalRounds,
+      timeLimit: r.timeLimit,
+      hostName: r.clients.get(r.hostId)?.name || '?',
+    }));
+}
+
+function broadcastPublicRooms() {
+  const list = getPublicRooms();
+  wss.clients.forEach(ws => {
+    if (ws.readyState === 1 && ws._wantsPublicList) {
+      ws.send(JSON.stringify({ type: 'public_rooms', rooms: list }));
+    }
+  });
+}
+
+// ─── WEBSOCKET ───────────────────────────────────
 wss.on('connection', (ws) => {
   let playerId = null;
   let roomCode = null;
+  ws._wantsPublicList = false;
 
   ws.on('message', (raw) => {
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
 
     switch (msg.type) {
+
+      case 'watch_public': {
+        ws._wantsPublicList = true;
+        sendTo(ws, { type: 'public_rooms', rooms: getPublicRooms() });
+        break;
+      }
 
       case 'create_room': {
         const code = Math.random().toString(36).substr(2, 6).toUpperCase();
@@ -73,24 +153,25 @@ wss.on('connection', (ws) => {
           answers: {},
           stoppedBy: null,
           timerTimeout: null,
+          isPublic: msg.isPublic !== false,
+          roomName: msg.roomName || `Sala de ${msg.name}`,
         };
         sendTo(ws, { type: 'room_created', roomCode: code, playerId });
         sendTo(ws, { type: 'room_state', ...getRoomState(code) });
+        broadcastPublicRooms();
         break;
       }
 
       case 'join_room': {
         const code = msg.roomCode.toUpperCase();
-        if (!rooms[code]) { sendTo(ws, { type: 'error', msg: 'Sala no encontrada' }); return; }
-        if (rooms[code].phase !== 'lobby') { sendTo(ws, { type: 'error', msg: 'La partida ya comenzó' }); return; }
-
+        if (!rooms[code]) { sendTo(ws, { type: 'error', msg: 'Sala no encontrada ❌' }); return; }
+        if (rooms[code].phase !== 'lobby') { sendTo(ws, { type: 'error', msg: 'La partida ya comenzó ⛔' }); return; }
         playerId = msg.playerId;
         roomCode = code;
         rooms[code].clients.set(playerId, { ws, name: msg.name, score: 0 });
-
         sendTo(ws, { type: 'joined', roomCode: code, playerId });
-        sendTo(ws, { type: 'room_state', ...getRoomState(code) });
         broadcastAll(code, { type: 'room_state', ...getRoomState(code) });
+        broadcastPublicRooms();
         break;
       }
 
@@ -99,14 +180,16 @@ wss.on('connection', (ws) => {
         if (!room || room.hostId !== playerId) return;
         if (msg.totalRounds) room.totalRounds = msg.totalRounds;
         if (msg.timeLimit) room.timeLimit = msg.timeLimit;
+        if (msg.isPublic !== undefined) room.isPublic = msg.isPublic;
+        if (msg.roomName) room.roomName = msg.roomName;
         broadcastAll(roomCode, { type: 'room_state', ...getRoomState(roomCode) });
+        broadcastPublicRooms();
         break;
       }
 
       case 'start_game': {
         const room = rooms[roomCode];
         if (!room || room.hostId !== playerId) return;
-
         const letters = 'ABCDEFGHIJLMNOPRSTV'.split('');
         const avail = letters.filter(l => !room.usedLetters.includes(l));
         const letter = avail[Math.floor(Math.random() * avail.length)];
@@ -117,30 +200,19 @@ wss.on('connection', (ws) => {
         room.answers = {};
         room.stoppedBy = null;
         const startedAt = Date.now();
-
-        broadcastAll(roomCode, {
-          type: 'round_start',
-          letter,
-          round: room.currentRound,
-          totalRounds: room.totalRounds,
-          timeLimit: room.timeLimit,
-          startedAt,
-        });
-
-        // Auto-stop timer
+        broadcastAll(roomCode, { type: 'round_start', letter, round: 1, totalRounds: room.totalRounds, timeLimit: room.timeLimit, startedAt });
         room.timerTimeout = setTimeout(() => autoStop(roomCode), room.timeLimit * 1000);
+        broadcastPublicRooms();
         break;
       }
 
       case 'call_stop': {
         const room = rooms[roomCode];
-        if (!room || room.phase !== 'playing') return;
-        if (room.stoppedBy) return;
+        if (!room || room.phase !== 'playing' || room.stoppedBy) return;
         room.stoppedBy = playerId;
         room.phase = 'collecting';
         clearTimeout(room.timerTimeout);
-        const stopperName = room.clients.get(playerId)?.name || '?';
-        broadcastAll(roomCode, { type: 'stop_called', stoppedBy: playerId, stopperName });
+        broadcastAll(roomCode, { type: 'stop_called', stoppedBy: playerId, stopperName: room.clients.get(playerId)?.name || '?' });
         break;
       }
 
@@ -148,23 +220,18 @@ wss.on('connection', (ws) => {
         const room = rooms[roomCode];
         if (!room) return;
         room.answers[playerId] = msg.answers;
-
-        // Check if all answered
-        const allIds = [...room.clients.keys()];
-        const allAnswered = allIds.every(id => room.answers[id]);
-        if (allAnswered) {
-          calculateResults(roomCode);
-        }
+        const allAnswered = [...room.clients.keys()].every(id => room.answers[id]);
+        if (allAnswered) calculateResults(roomCode);
         break;
       }
 
       case 'next_round': {
         const room = rooms[roomCode];
         if (!room || room.hostId !== playerId) return;
-
         const letters = 'ABCDEFGHIJLMNOPRSTV'.split('');
         const avail = letters.filter(l => !room.usedLetters.includes(l));
-        const letter = (avail.length ? avail : letters)[Math.floor(Math.random() * (avail.length || letters.length))];
+        const pool = avail.length ? avail : letters;
+        const letter = pool[Math.floor(Math.random() * pool.length)];
         room.usedLetters.push(letter);
         room.currentLetter = letter;
         room.currentRound += 1;
@@ -172,16 +239,7 @@ wss.on('connection', (ws) => {
         room.answers = {};
         room.stoppedBy = null;
         const startedAt = Date.now();
-
-        broadcastAll(roomCode, {
-          type: 'round_start',
-          letter,
-          round: room.currentRound,
-          totalRounds: room.totalRounds,
-          timeLimit: room.timeLimit,
-          startedAt,
-        });
-
+        broadcastAll(roomCode, { type: 'round_start', letter, round: room.currentRound, totalRounds: room.totalRounds, timeLimit: room.timeLimit, startedAt });
         room.timerTimeout = setTimeout(() => autoStop(roomCode), room.timeLimit * 1000);
         break;
       }
@@ -190,11 +248,9 @@ wss.on('connection', (ws) => {
         const room = rooms[roomCode];
         if (!room || room.hostId !== playerId) return;
         room.phase = 'final';
-        const finalScores = {};
-        room.clients.forEach((c, id) => { finalScores[id] = c.score; });
-        const players = {};
-        room.clients.forEach((c, id) => { players[id] = { name: c.name, score: c.score }; });
-        broadcastAll(roomCode, { type: 'game_over', scores: finalScores, players });
+        const scores = {}, players = {};
+        room.clients.forEach((c, id) => { scores[id] = c.score; players[id] = { name: c.name, score: c.score }; });
+        broadcastAll(roomCode, { type: 'game_over', scores, players });
         break;
       }
     }
@@ -209,6 +265,7 @@ wss.on('connection', (ws) => {
     } else {
       broadcastAll(roomCode, { type: 'room_state', ...getRoomState(roomCode) });
     }
+    broadcastPublicRooms();
   });
 });
 
@@ -218,71 +275,51 @@ function autoStop(roomCode) {
   room.stoppedBy = 'timeout';
   room.phase = 'collecting';
   broadcastAll(roomCode, { type: 'stop_called', stoppedBy: 'timeout', stopperName: 'el tiempo' });
-  // Give 3s for answers to arrive, then force calculate
   setTimeout(() => {
     const room = rooms[roomCode];
     if (!room) return;
-    room.clients.forEach((_, id) => {
-      if (!room.answers[id]) room.answers[id] = {};
-    });
+    room.clients.forEach((_, id) => { if (!room.answers[id]) room.answers[id] = {}; });
     calculateResults(roomCode);
   }, 3000);
 }
 
-function calculateResults(roomCode) {
+async function calculateResults(roomCode) {
   const room = rooms[roomCode];
   if (!room) return;
-
-  const CATEGORIES = ['nombre','apellido','animal','fruta','pais','ciudad','color','comida','objeto','profesion'];
   const letter = room.currentLetter;
   const answers = room.answers;
-  const roundScores = {};
 
+  broadcastAll(roomCode, { type: 'validating' });
+
+  const validationResults = {};
+  await Promise.all(
+    [...room.clients.keys()].map(async id => {
+      validationResults[id] = await validateWithGroq(answers[id] || {}, letter);
+    })
+  );
+
+  const roundScores = {};
   room.clients.forEach((_, id) => { roundScores[id] = 0; });
 
   CATEGORIES.forEach(cat => {
     const validAnswers = {};
     room.clients.forEach((_, id) => {
       const val = (answers[id]?.[cat] || '').trim();
-      if (val && val[0].toUpperCase() === letter) {
-        validAnswers[id] = val.toLowerCase();
-      }
+      if (val && validationResults[id]?.[cat] === true) validAnswers[id] = val.toLowerCase();
     });
-
     const counts = {};
     Object.values(validAnswers).forEach(v => { counts[v] = (counts[v] || 0) + 1; });
-
-    Object.entries(validAnswers).forEach(([id, v]) => {
-      roundScores[id] += counts[v] === 1 ? 10 : 5;
-    });
+    Object.entries(validAnswers).forEach(([id, v]) => { roundScores[id] += counts[v] === 1 ? 10 : 5; });
   });
 
-  // Add to cumulative scores
-  room.clients.forEach((client, id) => {
-    client.score = (client.score || 0) + (roundScores[id] || 0);
-  });
+  room.clients.forEach((client, id) => { client.score = (client.score || 0) + (roundScores[id] || 0); });
 
-  const scores = {};
-  const players = {};
-  room.clients.forEach((c, id) => {
-    scores[id] = c.score;
-    players[id] = { name: c.name, score: c.score };
-  });
-
+  const scores = {}, players = {};
+  room.clients.forEach((c, id) => { scores[id] = c.score; players[id] = { name: c.name, score: c.score }; });
   room.phase = 'results';
 
-  broadcastAll(roomCode, {
-    type: 'round_results',
-    letter,
-    round: room.currentRound,
-    totalRounds: room.totalRounds,
-    answers,
-    roundScores,
-    scores,
-    players,
-    stoppedBy: room.stoppedBy,
-  });
+  broadcastAll(roomCode, { type: 'round_results', letter, round: room.currentRound, totalRounds: room.totalRounds, answers, validationResults, roundScores, scores, players, stoppedBy: room.stoppedBy });
 }
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`🎯 Tutti Frutti server running on port ${PORT}`));
+server.listen(PORT, () => console.log(`🎯 Tutti Frutti server on port ${PORT}`));
