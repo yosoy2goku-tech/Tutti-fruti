@@ -42,12 +42,17 @@ async function validateWithGroq(answers, letter) {
   }
 
   const prompt = `Eres árbitro del juego Tutti Frutti en español. Letra de la ronda: "${letter}"
+
 Respuestas del jugador:
 ${lines}
 
-Una respuesta es VÁLIDA si: empieza con "${letter}" (tildes no importan, ej A acepta Ángel), pertenece a la categoría y es palabra real en español.
-Responde SOLO JSON sin explicación: {"nombre":true,"apellido":false,...}
-Incluye todas estas claves: ${CATEGORIES.join(',')}`;
+REGLAS para marcar como true (válido):
+1. La palabra debe empezar con la letra "${letter}". Las tildes NO importan (letra A acepta Ángel, Águila; letra E acepta Élite).
+2. Debe pertenecer a la categoría. Sé GENEROSO: acepta nombres comunes, apellidos, animales, frutas, países, ciudades, colores, comidas, objetos y profesiones conocidas.
+3. En caso de duda, marca true. Solo marca false si claramente NO empieza con "${letter}" o no tiene nada que ver con la categoría.
+
+Responde SOLO con JSON sin texto extra: {"nombre":true,"apellido":false,...}
+Incluye exactamente estas claves: ${CATEGORIES.join(',')}`;
 
   try {
     const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
