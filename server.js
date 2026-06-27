@@ -12,15 +12,24 @@ app.use(express.static(path.join(__dirname, 'public')));
 const rooms = {};
 const CATEGORIES = ['nombre','apellido','animal','fruta','pais','ciudad','color','comida','objeto','profesion'];
 
-function broadcastAll(roomCode, data) {
+function broadcastAll(roomCode, data, excludeId = null) {
   const room = rooms[roomCode];
   if (!room) return;
   const msg = JSON.stringify(data);
-  room.clients.forEach(c => { if (c.ws.readyState === 1) c.ws.send(msg); });
+  room.clients.forEach((c, id) => {
+    if (id !== excludeId && c.ws.readyState === 1) c.ws.send(msg);
+  });
 }
 
 function sendTo(ws, data) {
   if (ws.readyState === 1) ws.send(JSON.stringify(data));
+}
+
+function sendToId(roomCode, targetId, data) {
+  const room = rooms[roomCode];
+  if (!room) return;
+  const client = room.clients.get(targetId);
+  if (client) sendTo(client.ws, data);
 }
 
 function getRoomState(code) {
@@ -72,7 +81,6 @@ function calculateResults(roomCode) {
   });
 
   room.clients.forEach((c, id) => { c.score = (c.score||0) + (roundScores[id]||0); });
-
   const scores = {}, players = {};
   room.clients.forEach((c,id) => { scores[id] = c.score; players[id] = { name: c.name, score: c.score }; });
   room.phase = 'results';
@@ -137,6 +145,9 @@ wss.on('connection', (ws) => {
         playerId = msg.playerId; roomCode = code;
         rooms[code].clients.set(playerId, { ws, name: msg.name, score: 0 });
         sendTo(ws, { type: 'joined', roomCode: code, playerId });
+        // Tell new player about existing players for WebRTC
+        const existingIds = [...rooms[code].clients.keys()].filter(id => id !== playerId);
+        sendTo(ws, { type: 'existing_peers', peers: existingIds });
         broadcastAll(code, { type: 'room_state', ...getRoomState(code) });
         broadcastPublicRooms();
         break;
@@ -212,12 +223,26 @@ wss.on('connection', (ws) => {
         broadcastAll(roomCode, { type: 'game_over', scores, players });
         break;
       }
+
+      // ─── WebRTC Signaling ───────────────────────
+      case 'webrtc_offer':
+        sendToId(roomCode, msg.targetId, { type: 'webrtc_offer', offer: msg.offer, fromId: playerId });
+        break;
+
+      case 'webrtc_answer':
+        sendToId(roomCode, msg.targetId, { type: 'webrtc_answer', answer: msg.answer, fromId: playerId });
+        break;
+
+      case 'webrtc_ice':
+        sendToId(roomCode, msg.targetId, { type: 'webrtc_ice', candidate: msg.candidate, fromId: playerId });
+        break;
     }
   });
 
   ws.on('close', () => {
     if (!roomCode || !rooms[roomCode]) return;
     rooms[roomCode].clients.delete(playerId);
+    broadcastAll(roomCode, { type: 'peer_left', peerId: playerId });
     if (rooms[roomCode].clients.size === 0) {
       clearTimeout(rooms[roomCode].timerTimeout);
       delete rooms[roomCode];
